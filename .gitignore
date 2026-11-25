@@ -1,0 +1,13 @@
+
+# Python creates these folders while running the code.
+# We don't need to upload them to GitHub.
+__pycache__/
+*.py[cod]
+
+# These folders contain our local Python environments.
+venv/
+.venv/
+
+# This file may contain API keys and other private settings.
+# I have done this because,  uploading those details to GitHub is not fine.
+.env
