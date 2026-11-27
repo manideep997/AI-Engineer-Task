@@ -1,25 +1,37 @@
+"""
+Extract structured project events from WhatsApp messages using NVIDIA NIM.
+
+The public extract_events() interface and returned event schema are kept
+compatible with state_engine.py.
+"""
 
 import os
 import json
 import re
-from typing import Literal
+import time
 
+from typing import Literal
 from dotenv import load_dotenv
 from openai import OpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel,ConfigDict
 
-
-# We're loading the NVIDIA API key and model settings from our .env file.
 load_dotenv()
 
-api_key = os.getenv("NVIDIA_API_KEY")
-model_name = os.getenv(
+API_KEY = os.getenv("NVIDIA_API_KEY")
+MODEL_NAME = os.getenv(
     "NVIDIA_MODEL",
     "nvidia/nemotron-3.5-lightning-30b-a3b"
 )
 
+BASE_URL = "https://integrate.api.nvidia.com/v1"
+# NVIDIA NIM extraction settings
+MAX_OUTPUT_TOKENS = 8192
+MAX_API_ATTEMPTS = 3
 
-# These are the different kinds of events our agent can identify.
+# Conservative batching for reliable event extraction
+DEFAULT_BATCH_SIZE = 1
+DEFAULT_CONTEXT_SIZE = 2
+
 EventType = Literal[
     "decision_proposed",
     "decision_confirmed",
@@ -32,7 +44,8 @@ EventType = Literal[
     "deadline_set",
     "deadline_changed",
     "requirement_added",
-    "other"
+    "meeting_scheduled",
+    "other",
 ]
 
 ConfirmationStatus = Literal[
@@ -40,343 +53,701 @@ ConfirmationStatus = Literal[
     "confirmed",
     "uncertain",
     "rejected",
-    "not_applicable"
+    "not_applicable",
 ]
 
+TASK_EVENT_TYPES = {
+    "task_assigned",
+    "task_reassigned",
+    "task_progress",
+    "task_completed",
+    "task_blocked",
+}
+ASSIGNMENT_EVENT_TYPES = {"task_assigned", "task_reassigned"}
+VALID_CONFIRMATION_STATUSES = {
+    "proposed",
+    "confirmed",
+    "uncertain",
+    "rejected",
+    "not_applicable",
+}
+
+
+# ---------------------------------------------------------------------------
+# Event schema
+# ---------------------------------------------------------------------------
 
 class ProjectEvent(BaseModel):
-    # Here we're describing what happened and what it relates to.
+    """One project event grounded in one or more WhatsApp messages."""
+
+    model_config = ConfigDict(extra="ignore")
+
     event_type: EventType
     subject: str
-    details: str | None = None
-
-    # The person who communicated the event and the actual task owner
-    # are two different things, so we're keeping them separate.
+    details: str
     actor: str | None = None
     owner: str | None = None
-
-    # This helps us distinguish a suggestion from an actual team decision.
-    confirmation_status: ConfirmationStatus
-
-    # All the original messages that support this event are stored here.
-    evidence_message_ids: list[int] = Field(min_length=1)
-
-    # This identifies the message where the event actually becomes clear.
+    confirmation_status: ConfirmationStatus = "not_applicable"
+    evidence_message_ids: list[int]
     event_message_id: int
-
-    # We'll take the timestamp directly from that original message.
     timestamp: str
 
 
-# These instructions tell the LLM how to interpret the WhatsApp conversation.
-SYSTEM_PROMPT = """
-You are an assistant that analyses WhatsApp group conversations
-and extracts accurate project-related events.
+# ---------------------------------------------------------------------------
+# LLM instructions
+# ---------------------------------------------------------------------------
 
-Read the messages carefully. Understand the meaning and context,
-including English, Hinglish and informal conversations.
+SYSTEM_PROMPT = r"""
+You are a careful information-extraction system for WhatsApp project chats.
 
-Identify meaningful project events.
+Extract project events ONLY from new_messages. context_messages are provided
+only to understand references and earlier discussion. Do not create an event
+whose event_message_id belongs only to context_messages.
 
-EVENT TYPES:
+The chat may contain English, Hinglish, abbreviations, typos, and informal
+language. Do not invent facts. If the messages do not establish something,
+leave it unknown.
 
-- decision_proposed:
-  Someone suggests an option. The team has not confirmed it yet.
-
-- decision_confirmed:
-  A person clearly confirms or accepts a decision.
-
-- decision_changed:
-  An earlier confirmed decision is explicitly replaced or reversed.
-
-- task_assigned:
-  A task is assigned to someone for the first time.
-
-- task_reassigned:
-  Responsibility for an existing task is transferred to someone else.
-
-- task_progress:
-  Someone gives an update about work that is currently happening.
-
-- task_completed:
-  Someone clearly confirms that work is finished.
-
-- task_blocked:
-  A specific issue is actually preventing the task from progressing.
-
-- deadline_set: A deadline is established for the first time.
-- deadline_changed: An existing deadline is explicitly changed or replaced.
-
-- requirement_added:
-  A new project requirement is introduced.
-
-- other:
-  A meaningful project event that does not fit the categories above.
-
-IMPORTANT RULES:
-
-1. A suggestion is not a confirmed decision.
-
-2. Someone saying "maybe", "I think", "haan shayad" or something
-   similarly uncertain does not establish a confirmed decision.
-
-3. A decision is changed only when an earlier confirmed decision
-   is explicitly replaced or reversed.
-
-4. Do not confuse the person sending a message with the person
-   responsible for a task.
-
-5. The actor is the person who communicated the event.
-
-6. The owner is the person explicitly responsible for doing the task.
-   If the owner is unclear, return null.
-
-7. Do not assign task ownership to someone just because they reported
-   a problem or discussed the task.
-
-8. A task being difficult does not automatically mean it is blocked.
-   Use task_blocked only when an actual obstacle prevents progress.
-
-9. Do not treat promises as completed work.
-
-10. A task can be mentioned using different names. Use a short,
-    consistent subject where the relationship is clear.
-    For example, use "Database schema" rather than switching
-    between "DB schema" and "Database schema".
-
-11. Do not merge two genuinely different tasks.
-
-12. A single message can contain multiple independent events.
-
-13. If multiple messages are needed to understand an event,
-    include all relevant message IDs as evidence.
-
-14. event_message_id must identify the message where the event
-    is established. For a confirmed decision, this should normally
-    be the confirmation message, not the original suggestion.
-
-15. Every evidence_message_id and event_message_id must come
-    from the messages provided.
-
-16. Do not invent people, dates, tasks, decisions or information.
-
-17. Preserve the original meaning of Hinglish messages.
-
-18. Ignore greetings, jokes and unrelated conversations.
-
-19. If a message does not contain a meaningful project event,
-    do not create an event for it.
-
-CONFIRMATION STATUS:
-
-- proposed: An option has been suggested but not confirmed.
-- confirmed: The event or decision has been explicitly confirmed.
-- uncertain: The conversation does not establish a clear outcome.
-- rejected: An option has explicitly been rejected.
-- not_applicable: Confirmation status does not apply to this event.
-
-Return only valid JSON in this structure:
-
+Return valid JSON only, in this exact outer structure:
 {
-    "events": [
-        {
-            "event_type": "task_assigned",
-            "subject": "Authentication",
-            "details": "Authentication work was assigned to Rohan.",
-            "actor": "Aarav",
-            "owner": "Rohan",
-            "confirmation_status": "confirmed",
-            "evidence_message_ids": [17],
-            "event_message_id": 17
-        }
-    ]
+  "events": [
+    {
+      "event_type": "task_assigned",
+      "subject": "Authentication",
+      "details": "Rohan was assigned authentication.",
+      "actor": "Aarav",
+      "owner": "Rohan",
+      "confirmation_status": "confirmed",
+      "evidence_message_ids": [17],
+      "event_message_id": 17,
+      "timestamp": "2026-10-05T20:02:00"
+    }
+  ]
 }
 
-If no meaningful events are found, return:
+If there are no project events, return {"events": []}.
 
-{
-    "events": []
-}
+OUTPUT SIZE RULES:
+- Return only the JSON object. Do not explain your reasoning.
+- Keep each event's details to 20 words or fewer.
+- Extract only meaningful project events; skip casual conversation.
+- Do not repeat the same event in one response.
+- Do not add optional commentary or Markdown fences.
+
+ALLOWED EVENT TYPES:
+decision_proposed, decision_confirmed, decision_changed,
+task_assigned, task_reassigned, task_progress, task_completed,
+task_blocked, deadline_set, deadline_changed, requirement_added,
+meeting_scheduled, other.
+
+ACTOR AND OWNER ARE DIFFERENT:
+1. actor is always the sender of event_message_id.
+2. owner is the person actually responsible for the task.
+3. Never assume the sender owns a task just because they sent the message.
+4. If ownership is not explicit, owner must be null.
+5. For first-person statements such as "I'll handle payments",
+   "main deployment kar lunga", or "chat main kar lunga", the sender is owner.
+6. If a message explicitly allocates tasks to named people, use the person
+   named next to that specific task.
+7. A single task-allocation message can produce multiple separate events.
+8. Example:
+   Aarav: Task split:
+   Rohan - authentication
+   Priya - listings UI
+   Meera - payments
+   Kabir - search and chat
+   Main - deployment
+   Correct owners are Rohan, Priya, Meera, Kabir, and Aarav respectively.
+   Aarav is the actor for all events, but not the owner of all tasks.
+9. Do not infer owner from a previous unrelated task or from who usually
+   performs that type of work.
+10. If someone asks another person to take a task, that is not confirmed
+    until the person accepts.
+11. A question such as "search kaun karega?" is not an assignment.
+12. "Search Saturday ko discuss karte hain" is not an assignment.
+13. A meeting agenda asking the team to decide an owner is not a reassignment.
+14. A proposed assignment must have confirmation_status "proposed" or
+    "uncertain", not "confirmed".
+15. A task_reassigned event requires evidence of an actual ownership change.
+16. Do not mark a task blocked merely because it is pending. Use task_blocked
+    only when an actual blocker/prevention is stated.
+17. Do not mark a task completed merely because someone promises to finish it.
+18. Preserve stated progress percentages and important qualifiers.
+19. Do not merge different tasks just because they have the same owner.
+20. If an owner is unclear, use null rather than guessing.
+
+TASK EVENT TYPE:
+- task_assigned: a new assignment is explicitly made and accepted/confirmed.
+- task_reassigned: an existing task is explicitly transferred and accepted.
+- task_progress: work has started or progress is reported.
+- task_completed: work is explicitly finished, merged, or delivered.
+- task_blocked: work cannot proceed because of a stated blocker.
+
+DECISIONS:
+1. A suggestion/recommendation is decision_proposed.
+2. An explicit agreement is decision_confirmed.
+3. A replacement of an earlier confirmed choice is decision_changed.
+4. "Agreed", "+1", "Django fine", and similar statements count as agreement
+   only when the referenced choice is clear from the supplied context.
+5. Do not treat a question as a decision.
+6. Track separate decisions independently: backend, frontend, database,
+   payment gateway, deployment platform, and other distinct topics.
+7. Do not add technologies or details that are not supported by evidence.
+8. Use confirmation_status consistently:
+   decision_proposed -> proposed
+   decision_confirmed -> confirmed
+   decision_changed -> confirmed
+
+DEADLINES AND MEETINGS:
+1. Extract a deadline only when a date/time is stated or unambiguously
+   resolved from the supplied conversation.
+2. If a deadline is changed, use deadline_changed.
+3. Distinguish a proposed date from a confirmed date.
+4. Extract meeting date, time, and location only when present.
+5. Do not assume a meeting happened just because it was scheduled.
+6. Preserve ambiguity instead of inventing a date.
+
+EVIDENCE AND SOURCE FIELDS:
+1. Every event must include evidence_message_ids.
+2. IDs must come from messages in the supplied input.
+3. event_message_id must be the new message that actually communicates
+   the event, not merely a related earlier context message.
+4. Include relevant context IDs as additional evidence when necessary.
+5. Do not use unrelated messages as evidence.
+6. actor must equal the sender of event_message_id.
+7. Do not invent IDs, sender names, or timestamps.
+8. The program will replace actor and timestamp with source values, but you
+   must still identify the correct event_message_id.
 """
 
 
-def create_nvidia_client():
-    # Before connecting, let's check whether our NVIDIA API key is available.
-    if not api_key:
+# ---------------------------------------------------------------------------
+# API client and batching
+# ---------------------------------------------------------------------------
+
+def create_open_client():
+    if not API_KEY:
         raise ValueError(
-            "NVIDIA API key not found. Please check your .env file."
+            "NVIDIA_API_KEY was not found. Add it to your .env file."
         )
 
-    # We're using the OpenAI library to connect to NVIDIA's API.
     return OpenAI(
-        base_url="https://integrate.api.nvidia.com/v1",
-        api_key=api_key,
-        timeout=90.0,
+        base_url=BASE_URL,
+        api_key=API_KEY,
+        timeout=120,
         max_retries=0
     )
 
 
-def split_into_batches(messages, batch_size):
-    # Here we're dividing the conversation into smaller groups.
+def build_batch_windows(messages, batch_size, context_size):
+    """Return (context, new_messages) windows without losing message order."""
+
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1.")
+    if context_size < 0:
+        raise ValueError("context_size cannot be negative.")
+
+    windows = []
     for start in range(0, len(messages), batch_size):
-        yield messages[start:start + batch_size]
+        end = start + batch_size
+        context_start = max(0, start - context_size)
+        windows.append((messages[context_start:start], messages[start:end]))
+    return windows
 
 
-def extract_json_response(response_text):
-    response_text = response_text.strip()
+def prepare_messages(messages):
+    """Keep only fields needed by the model; preserve full message text."""
 
-    # Sometimes the model wraps its JSON response in Markdown code blocks.
-    response_text = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        response_text,
-        flags=re.IGNORECASE
+    return [
+        {
+            "id": message["id"],
+            "timestamp": str(message["timestamp"]),
+            "sender": str(message["sender"]),
+            "message": str(message["message"]),
+        }
+        for message in messages
+    ]
+
+
+# ---------------------------------------------------------------------------
+# JSON response handling
+# ---------------------------------------------------------------------------
+
+def extract_json_response(content):
+    """Parse JSON, tolerating surrounding Markdown or explanatory text."""
+
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("The model returned an empty response.")
+
+    cleaned = content.strip()
+    cleaned = re.sub(
+        r"^\s*```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE
     )
-
-    response_text = re.sub(r"\s*```$", "", response_text)
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
 
     try:
-        return json.loads(response_text)
-
-    except json.JSONDecodeError as error:
-        print("\nInvalid JSON received from the LLM.")
-        print("Error:", error)
-        print("\nActual LLM response:")
-        print(response_text)
-
-        raise
-
-
-def extract_events_from_batch(client, messages):
-    # We're preparing the messages in a simple format for the LLM.
-    chat_content = []
-
-    for message in messages:
-        chat_content.append({
-            "id": message["id"],
-            "timestamp": message["timestamp"],
-            "sender": message["sender"],
-            "message": message["message"]
-        })
-
-    # Now we're converting the messages into JSON.
-    user_prompt = json.dumps(
-        chat_content,
-        ensure_ascii=False,
-        indent=2
-    )
-
-    # We're asking Nemotron to extract structured project events.
-    response = client.chat.completions.create(
-    model=model_name,
-    temperature=0,
-    max_tokens=8192,
-    extra_body={
-        "chat_template_kwargs": {
-            "enable_thinking": False
-        }
-    },
-    messages=[
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT
-        },
-        {
-            "role": "user",
-            "content": user_prompt
-        }
-    ]
-)
-
-    response_text = response.choices[0].message.content
-
-    print("\nLLM response details:")
-    print("Finish reason:", response.choices[0].finish_reason)
-
-    if not response_text:
-        print("The model returned an empty response.")
-        raise ValueError("The NVIDIA model returned an empty response.")
-
-    print("Received response successfully.")
-
-    result = extract_json_response(response_text)
-
-    if not isinstance(result, dict) or not isinstance(
-        result.get("events"), list
-    ):
-        raise ValueError("The LLM returned an invalid events structure.")
-
-    return result["events"]
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        start = cleaned.find("{")
+        if start < 0:
+            raise ValueError("The model response contains no JSON object.")
+        try:
+            parsed, _ = decoder.raw_decode(cleaned[start:])
+            return parsed
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"The model returned malformed JSON: {error}"
+            ) from error
 
 
-def extract_events(messages, batch_size=10):
-    # System notifications are not needed for this extraction stage.
-    user_messages = [
-        message for message in messages
-        if message["message_type"] == "user"
-    ]
+def _response_content(response):
+    """Read standard chat-completion content and detect token truncation."""
 
-    client = create_nvidia_client()
+    if not response.choices:
+        raise ValueError("The API response contained no choices.")
 
-    all_events = []
+    choice = response.choices[0]
+    if choice.finish_reason == "length":
+        raise ValueError(
+            "OpenRouter/model truncated the response (finish_reason='length'). "
+            "Reduce batch_size to 1 or use a model with a larger output limit."
+        )
 
-    # We're processing the messages batch by batch.
-    for batch_number, batch in enumerate(
-        split_into_batches(user_messages, batch_size),
-        start=1
-    ):
-        print(f"Extracting events from batch {batch_number}...")
+    content = choice.message.content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(part.get("text", ""))
+            elif isinstance(part, str):
+                parts.append(part)
+        content = "\n".join(parts)
 
-        raw_events = extract_events_from_batch(client, batch)
+    if not content:
+        raise ValueError("The model returned an empty response.")
+    return content
 
-        # This lets us look up the original message using its ID.
-        message_lookup = {
-            message["id"]: message
-            for message in batch
-        }
 
-        for raw_event in raw_events:
+def extract_events_from_batch(client, context_messages, new_messages):
+    """Call OpenRouter for one batch and return raw event dictionaries."""
 
-            evidence_ids = raw_event.get("evidence_message_ids", [])
+    payload = {
+        "context_messages": prepare_messages(context_messages),
+        "new_messages": prepare_messages(new_messages),
+    }
 
-            if not isinstance(evidence_ids, list) or not evidence_ids:
-                continue
-
-            # Every evidence message must belong to this batch.
-            if any(
-                message_id not in message_lookup
-                for message_id in evidence_ids
-            ):
-                continue
-
-            # If the model hasn't supplied a valid event message ID,
-            # we'll use the latest supporting message as a fallback.
-            event_message_id = raw_event.get("event_message_id")
-
-            if event_message_id not in evidence_ids:
-                event_message_id = max(
-                    evidence_ids,
-                    key=lambda message_id: message_lookup[message_id]["timestamp"]
-                )
-
-            # We're taking the actual sender and timestamp from the chat.
-            event_message = message_lookup[event_message_id]
-
-            event = ProjectEvent(
-                event_type=raw_event["event_type"],
-                subject=raw_event["subject"],
-                details=raw_event.get("details"),
-                actor=event_message.get("sender"),
-                owner=raw_event.get("owner"),
-                confirmation_status=raw_event["confirmation_status"],
-                evidence_message_ids=evidence_ids,
-                event_message_id=event_message_id,
-                timestamp=event_message["timestamp"]
+    last_error = None
+    for attempt in range(1, MAX_API_ATTEMPTS + 1):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                temperature=0,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": json.dumps(payload, ensure_ascii=False),
+                    },
+                ],
             )
 
-            all_events.append(event.model_dump())
+            result = extract_json_response(_response_content(response))
+            if not isinstance(result, dict):
+                raise ValueError("Expected a JSON object from the model.")
 
-    # Events from different batches are arranged in chronological order.
-    all_events.sort(key=lambda event: event["timestamp"])
+            events = result.get("events")
+            if not isinstance(events, list):
+                raise ValueError(
+                    'The model response must contain an "events" list.'
+                )
+            return events
 
-    return all_events
+        except Exception as error:
+            last_error = error
+            if attempt < MAX_API_ATTEMPTS:
+                wait_seconds = min(2 ** (attempt - 1), 4)
+                print(
+                    f"Batch request attempt {attempt} failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+                print(f"Retrying in {wait_seconds} seconds...")
+                time.sleep(wait_seconds)
+
+    raise RuntimeError(
+        f"NVIDIA extraction failed after {MAX_API_ATTEMPTS} attempts: "
+        f"{last_error}"
+    ) from last_error
+
+
+# ---------------------------------------------------------------------------
+# Conservative ownership validation
+# ---------------------------------------------------------------------------
+
+def _name_appears_in_text(name, text):
+    if not name or not text:
+        return False
+    escaped = re.escape(name.strip())
+    return re.search(
+        rf"(?<!\w){escaped}(?!\w)", text, flags=re.IGNORECASE
+    ) is not None
+
+
+def _is_explicit_first_person_ownership(message_text):
+    """Detect a clear first-person commitment, not a vague intention."""
+
+    text = message_text.lower()
+    patterns = [
+        r"\bi(?:'ll| will)\s+(?:take|handle|do|own|implement|finish|complete)\b",
+        r"\bi(?:'m| am)\s+(?:taking|handling|doing|implementing)\b",
+        r"\bi(?:'ll| will)\s+be\s+(?:handling|doing|working on)\b",
+        r"\bmain\s+(?:yeh\s+)?(?:kaam\s+)?(?:kar lunga|kar lungi|sambhal lunga|sambhal lungi)\b",
+        r"\bmain\s+(?:deployment|auth|authentication|payments|payment|search|chat)\s+(?:kar lunga|kar lungi|sambhal lunga|sambhal lungi)\b",
+        r"\b(?:chat|auth|authentication|payments|payment|search)\s+main\s+kar\s+(?:lunga|lungi)\b",
+        r"\b(?:theek hai|okay|ok),?\s+main\s+(?:le leta hoon|le leti hoon|kar lunga|kar lungi)\b",
+        r"\b(?:i accept|i can take|i'll take it|i will take it)\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _is_self_allocation_line(message_text, subject):
+    """
+    Match roster syntax such as 'Main - deployment' for the message sender.
+    This is intentionally narrow to avoid treating ordinary mentions of
+    'main' as an assignment.
+    """
+
+    subject_words = [
+        word.lower()
+        for word in re.findall(r"[a-zA-Z]+", subject or "")
+        if len(word) > 2
+    ]
+    if not subject_words:
+        return False
+
+    for line in message_text.splitlines():
+        normalized = line.strip().lower()
+        if not re.search(r"^\s*main\s*[-:–]\s*", normalized):
+            continue
+        if any(word in normalized for word in subject_words):
+            return True
+    return False
+
+
+def resolve_task_owner(raw_owner, event_message, known_senders, subject=""):
+    """
+    Accept an owner only when supported by the event's source message.
+
+    A named third-party owner must appear in the source message. The sender
+    can own a task through an explicit first-person commitment or a roster
+    line such as 'Main - deployment'.
+    """
+
+    message_text = str(event_message.get("message", ""))
+    sender = event_message.get("sender")
+    owner_candidate = str(raw_owner or "").strip()
+
+    if not owner_candidate or owner_candidate.lower() in {
+        "none", "null", "unknown", "unassigned", "not specified",
+        "not identified", "n/a",
+    }:
+        if sender and (
+            _is_explicit_first_person_ownership(message_text)
+            or _is_self_allocation_line(message_text, subject)
+        ):
+            return sender
+        return None
+
+    matched_sender = next(
+        (
+            known_sender
+            for known_sender in known_senders
+            if known_sender.casefold() == owner_candidate.casefold()
+        ),
+        None,
+    )
+    if matched_sender is None:
+        return None
+
+    if _name_appears_in_text(matched_sender, message_text):
+        return matched_sender
+
+    if (
+        sender
+        and matched_sender.casefold() == str(sender).casefold()
+        and (
+            _is_explicit_first_person_ownership(message_text)
+            or _is_self_allocation_line(message_text, subject)
+        )
+    ):
+        return sender
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Event validation and source grounding
+# ---------------------------------------------------------------------------
+
+def _normalise_confirmation(value):
+    if not isinstance(value, str):
+        return "not_applicable"
+    value = value.strip().lower()
+    return value if value in VALID_CONFIRMATION_STATUSES else "uncertain"
+
+
+def _normalise_event_text(value, field_name):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Event is missing a valid {field_name}.")
+    return value.strip()
+
+
+def validate_and_build_event(
+    raw_event,
+    message_lookup,
+    core_message_ids,
+    known_senders,
+):
+    """Validate one model event and replace source fields with trusted data."""
+
+    if not isinstance(raw_event, dict):
+        return None
+
+    event_message_id = raw_event.get("event_message_id")
+    if (
+        not isinstance(event_message_id, int)
+        or isinstance(event_message_id, bool)
+        or event_message_id not in core_message_ids
+        or event_message_id not in message_lookup
+    ):
+        return None
+
+    event_message = message_lookup[event_message_id]
+
+    try:
+        event_type = raw_event.get("event_type")
+        subject = _normalise_event_text(raw_event.get("subject"), "subject")
+        details = _normalise_event_text(raw_event.get("details"), "details")
+
+        raw_evidence = raw_event.get("evidence_message_ids", [])
+        if not isinstance(raw_evidence, list):
+            raw_evidence = []
+
+        valid_evidence_ids = []
+        for message_id in raw_evidence:
+            if (
+                isinstance(message_id, int)
+                and not isinstance(message_id, bool)
+                and message_id in message_lookup
+                and message_id not in valid_evidence_ids
+            ):
+                valid_evidence_ids.append(message_id)
+        if event_message_id not in valid_evidence_ids:
+            valid_evidence_ids.append(event_message_id)
+
+        confirmation_status = _normalise_confirmation(
+            raw_event.get("confirmation_status")
+        )
+
+        owner = None
+        if event_type in TASK_EVENT_TYPES:
+            owner = resolve_task_owner(
+                raw_event.get("owner"),
+                event_message,
+                known_senders,
+                subject=subject,
+            )
+
+        if event_type in ASSIGNMENT_EVENT_TYPES and owner is None:
+            if confirmation_status != "rejected":
+                confirmation_status = "uncertain"
+
+        source_text = str(event_message.get("message", "")).lower()
+        agenda_patterns = [
+            r"\bkaun\s+(?:karega|karegi)\b",
+            r"\bwho\s+(?:will|can)\s+(?:do|handle|take)\b",
+            r"\bwho's\s+(?:doing|handling)\b",
+            r"\bdiscuss\s+(?:the\s+)?(?:owner|ownership|who)",
+            r"\bdecide\s+(?:the\s+)?(?:owner|ownership)",
+            r"\bagenda\b",
+        ]
+        looks_like_agenda = any(
+            re.search(pattern, source_text) for pattern in agenda_patterns
+        )
+        if (
+            event_type in ASSIGNMENT_EVENT_TYPES
+            and looks_like_agenda
+            and owner is None
+            and confirmation_status != "rejected"
+        ):
+            confirmation_status = "uncertain"
+
+        event_data = {
+            "event_type": event_type,
+            "subject": subject,
+            "details": details,
+            "actor": event_message.get("sender"),
+            "owner": owner,
+            "confirmation_status": confirmation_status,
+            "evidence_message_ids": valid_evidence_ids,
+            "event_message_id": event_message_id,
+            "timestamp": str(event_message["timestamp"]),
+        }
+        return ProjectEvent(**event_data)
+
+    except (ValidationError, ValueError, TypeError) as error:
+        print(
+            f"Skipping invalid event from message {event_message_id}: {error}"
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+def remove_duplicate_events(events):
+    """Remove duplicate outputs while retaining distinct later updates."""
+
+    unique_events = []
+    seen = set()
+    for event in events:
+        signature = (
+            event.event_type,
+            " ".join(event.subject.casefold().split()),
+            event.event_message_id,
+            event.owner.casefold() if event.owner else None,
+        )
+        if signature not in seen:
+            seen.add(signature)
+            unique_events.append(event)
+    return unique_events
+
+
+# ---------------------------------------------------------------------------
+# Public extraction function
+# ---------------------------------------------------------------------------
+
+def extract_events(
+    messages,
+    batch_size=DEFAULT_BATCH_SIZE,
+    context_size=DEFAULT_CONTEXT_SIZE,
+):
+    """
+    Extract events from parsed WhatsApp messages.
+
+    Required fields per message: id, timestamp, sender, message.
+    Optional field: message_type (defaults to 'user').
+    Returns dictionaries compatible with state_engine.py.
+    """
+
+    if not isinstance(messages, list):
+        raise TypeError("messages must be a list of parsed message dictionaries.")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1.")
+    if context_size < 0:
+        raise ValueError("context_size cannot be negative.")
+
+    user_messages = [
+        message for message in messages
+        if message.get("message_type", "user") == "user"
+    ]
+    if not user_messages:
+        print("No user messages found. Nothing to extract.")
+        return []
+
+    seen_ids = set()
+    for message in user_messages:
+        required = ("id", "timestamp", "sender", "message")
+        missing = [key for key in required if key not in message]
+        if missing:
+            raise ValueError(
+                f"Parsed message is missing required fields {missing}: {message}"
+            )
+        message_id = message["id"]
+        if not isinstance(message_id, int) or isinstance(message_id, bool):
+            raise ValueError(f"Message ID must be an integer: {message_id!r}")
+        if message_id in seen_ids:
+            raise ValueError(f"Duplicate parsed message ID: {message_id}")
+        seen_ids.add(message_id)
+
+    known_senders = sorted(
+        {
+            str(message["sender"]).strip()
+            for message in user_messages
+            if message.get("sender")
+        },
+        key=str.casefold,
+    )
+
+    client = create_open_client()
+    batch_windows = build_batch_windows(
+        user_messages, batch_size, context_size
+    )
+    extracted_events = []
+
+    print(f"Messages sent for event extraction: {len(user_messages)}")
+    print(f"Extraction batches: {len(batch_windows)}")
+    print(f"NVIDIA model: {MODEL_NAME}")
+
+    for batch_number, (context_messages, core_messages) in enumerate(
+        batch_windows, start=1
+    ):
+        print(
+            f"\nExtracting events from batch "
+            f"{batch_number}/{len(batch_windows)}..."
+        )
+        print(f"Context messages: {len(context_messages)}")
+        print(f"New messages: {len(core_messages)}")
+
+        try:
+            raw_events = extract_events_from_batch(
+                client, context_messages, core_messages
+            )
+        except Exception as error:
+            # Do not silently skip a failed batch: partial extraction could
+            # make the project state misleading.
+            raise RuntimeError(
+                f"Event extraction failed at batch {batch_number}/"
+                f"{len(batch_windows)}. No complete result was produced. "
+                f"Original error: {type(error).__name__}: {error}"
+            ) from error
+
+        all_batch_messages = context_messages + core_messages
+        message_lookup = {
+            message["id"]: message for message in all_batch_messages
+        }
+        core_message_ids = {message["id"] for message in core_messages}
+
+        accepted_count = 0
+        for raw_event in raw_events:
+            event = validate_and_build_event(
+                raw_event,
+                message_lookup,
+                core_message_ids,
+                known_senders,
+            )
+            if event is not None:
+                extracted_events.append(event)
+                accepted_count += 1
+
+        print(
+            f"Raw events: {len(raw_events)} | "
+            f"Validated events: {accepted_count}"
+        )
+
+    extracted_events = remove_duplicate_events(extracted_events)
+    extracted_events.sort(
+        key=lambda event: (event.timestamp, event.event_message_id)
+    )
+
+    result = [event.model_dump() for event in extracted_events]
+    print(f"\nTotal validated unique events: {len(result)}")
+    return result
+
+
+if __name__ == "__main__":
+    print("Event extractor module loaded successfully.")
+    print(f"Configured NVIDIA model: {MODEL_NAME}")
+    print("Call extract_events(parsed_messages) from your pipeline.")

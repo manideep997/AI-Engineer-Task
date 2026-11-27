@@ -17,7 +17,7 @@ print("Total messages:", len(messages))
 
 # Now we're sending those messages to the LLM to identify project events.
 print("\nExtracting project events...")
-events = extract_events(messages, batch_size=10)
+events = extract_events(messages, batch_size=5)
 
 print("Total events extracted:", len(events))
 

@@ -1,11 +1,55 @@
 
-from collections import defaultdict
+# These names refer to the same task or topic in our chat.
+# We're using these aliases to avoid creating duplicate entries.
+
+TASK_ALIASES = {
+    "auth (login/signup)": "authentication",
+    "auth": "authentication",
+    "authentication": "authentication",
+
+    "listings ui": "listings ui",
+    "listing page first version": "listings ui",
+    "ui listing and filters": "listings ui",
+
+    "deployment": "deployment",
+    "render deployment": "deployment",
+}
+
+DECISION_ALIASES = {
+    "tech stack": "tech stack",
+    "technology stack": "technology stack",
+
+    "payment method": "payment gateway",
+    "payment gateway": "payment gateway",
+    "payment gateway (razorpay)": "payment gateway",
+
+    "deployment platform": "deployment platform",
+    "deployment": "deployment platform",
+}
+
+DEADLINE_ALIASES = {
+    "project report": "final report",
+    "report": "final report",
+    "report deadline": "final report",
+    "final report": "final report",
+
+    "demo day": "demo day",
+    "demo day date": "demo day",
+
+    "tests": "tests",
+}
 
 
 def clean_subject(subject):
-    # Sometimes the same task appears with slightly different spacing or capitalisation.
-    # We're cleaning the subject so those events can be grouped together.
+    # First, we're making the subject consistent.
     return " ".join(subject.strip().lower().split())
+
+
+def get_canonical_subject(subject, aliases):
+    # If we know two names refer to the same thing, we'll use one common name.
+    cleaned_subject = clean_subject(subject)
+
+    return aliases.get(cleaned_subject, cleaned_subject)
 
 
 def build_project_state(events):
@@ -14,8 +58,7 @@ def build_project_state(events):
     deadlines = {}
     other_events = []
 
-    # We're sorting the events by timestamp before processing them.
-    # This helps us understand what happened first and what changed later.
+    # Events need to be processed in chronological order.
     sorted_events = sorted(
         events,
         key=lambda event: event["timestamp"]
@@ -24,9 +67,10 @@ def build_project_state(events):
     for event in sorted_events:
         event_type = event["event_type"]
         subject = event["subject"]
-        subject_key = clean_subject(subject)
+        confirmation = event.get("confirmation_status", "confirmed")
 
-        # First, we're handling events related to tasks.
+        # ---------------- TASKS ----------------
+
         if event_type in [
             "task_assigned",
             "task_reassigned",
@@ -34,12 +78,12 @@ def build_project_state(events):
             "task_completed",
             "task_blocked"
         ]:
+            subject_key = get_canonical_subject(subject, TASK_ALIASES)
 
-            # If this is the first time we're seeing this task,
-            # we're creating a place to store its current information and history.
             if subject_key not in tasks:
                 tasks[subject_key] = {
                     "subject": subject,
+                    "initial_owner": None,
                     "owner": None,
                     "status": "not_started",
                     "details": None,
@@ -47,40 +91,54 @@ def build_project_state(events):
                 }
 
             task = tasks[subject_key]
-
-            # Every event is added to the history so we don't lose earlier updates.
             task["history"].append(event)
 
-            # An assignment or reassignment updates the current task owner.
-            if event_type in ["task_assigned", "task_reassigned"]:
-                if event.get("owner"):
-                    task["owner"] = event["owner"]
+            # We keep proposed changes in history, but don't treat them
+            # as confirmed changes to the task.
+            if confirmation in ["proposed", "uncertain", "rejected"]:
+                continue
 
-                if task["status"] == "not_started":
+            # If an owner is explicitly mentioned, update the current owner.
+            # This also lets progress and completion events update ownership.
+            new_owner = event.get("owner")
+
+            if new_owner:
+                if task["initial_owner"] is None:
+                    task["initial_owner"] = new_owner
+
+                task["owner"] = new_owner
+
+            if event_type == "task_assigned":
+                if task["status"] != "completed":
                     task["status"] = "assigned"
 
-            # A progress update means someone has started working on the task.
+            elif event_type == "task_reassigned":
+                if task["status"] != "completed":
+                    task["status"] = "assigned"
+
             elif event_type == "task_progress":
                 task["status"] = "in_progress"
 
-            # If the team says the task is completed, we update its status.
             elif event_type == "task_completed":
                 task["status"] = "completed"
 
-            # If someone reports a blocker, we mark the task as blocked.
             elif event_type == "task_blocked":
                 task["status"] = "blocked"
 
-            # We're keeping the latest details available for this task.
             if event.get("details"):
                 task["details"] = event["details"]
 
-        # Next, we're handling project decisions.
+        # ---------------- DECISIONS ----------------
+
         elif event_type in [
             "decision_proposed",
             "decision_confirmed",
             "decision_changed"
         ]:
+            subject_key = get_canonical_subject(
+                subject,
+                DECISION_ALIASES
+            )
 
             if subject_key not in decisions:
                 decisions[subject_key] = {
@@ -93,31 +151,41 @@ def build_project_state(events):
             decision = decisions[subject_key]
             decision["history"].append(event)
 
-            # A proposal is stored separately because it isn't necessarily final.
             if event_type == "decision_proposed":
                 decision["proposals"].append(event)
 
-            # A confirmed or changed decision becomes the current decision.
             elif event_type in [
                 "decision_confirmed",
                 "decision_changed"
             ]:
-                decision["current_decision"] = event
+                if confirmation == "confirmed":
+                    decision["current_decision"] = event
 
-        # We're keeping deadline events separately for each subject.
-        elif event_type == "deadline_set":
+        # ---------------- DEADLINES ----------------
+
+        elif event_type in ["deadline_set", "deadline_changed"]:
+            subject_key = get_canonical_subject(
+                subject,
+                DEADLINE_ALIASES
+            )
+
             if subject_key not in deadlines:
                 deadlines[subject_key] = {
                     "subject": subject,
                     "current_deadline": None,
+                    "proposals": [],
                     "history": []
                 }
 
-            deadlines[subject_key]["history"].append(event)
-            deadlines[subject_key]["current_deadline"] = event
+            deadline = deadlines[subject_key]
+            deadline["history"].append(event)
 
-        # We don't want to throw away meaningful events that don't fit
-        # into the task, decision or deadline categories.
+            if confirmation in ["proposed", "uncertain"]:
+                deadline["proposals"].append(event)
+
+            elif confirmation == "confirmed":
+                deadline["current_deadline"] = event
+
         else:
             other_events.append(event)
 
@@ -130,7 +198,6 @@ def build_project_state(events):
 
 
 def print_project_state(project_state):
-    # This function displays the latest project information in a readable way.
     print("\n========== CURRENT PROJECT STATE ==========\n")
 
     print("TASKS")
@@ -140,7 +207,8 @@ def print_project_state(project_state):
 
     for task in project_state["tasks"].values():
         print(f"\nTask: {task['subject']}")
-        print(f"Owner: {task['owner'] or 'Not assigned'}")
+        print(f"Initial owner: {task['initial_owner'] or 'Not identified'}")
+        print(f"Current owner: {task['owner'] or 'Not assigned'}")
         print(f"Status: {task['status']}")
         print(f"Latest update: {task['details'] or 'No details available'}")
 
@@ -168,6 +236,10 @@ def print_project_state(project_state):
         current = deadline["current_deadline"]
 
         print(f"\nTopic: {deadline['subject']}")
-        print(f"Latest deadline update: {current.get('details')}")
+
+        if current:
+            print(f"Latest confirmed deadline: {current.get('details')}")
+        else:
+            print("No confirmed deadline found.")
 
     print("\n===========================================\n")

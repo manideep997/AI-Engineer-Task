@@ -11,3 +11,5 @@ venv/
 # This file may contain API keys and other private settings.
 # I have done this because,  uploading those details to GitHub is not fine.
 .env
+# VS Code settings
+.vscode/

@@ -34,7 +34,8 @@ for test_name, start_id, end_id in test_ranges:
     # We're extracting events from this selected part.
     events = extract_events(
         selected_messages,
-        batch_size=5
+        batch_size=2
+        context_size=2
     )
 
     print("\nExtracted events:")
